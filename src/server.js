@@ -1,4 +1,5 @@
 import http from 'node:http';
+import fs from 'node:fs';
 import path from 'node:path';
 import { createCommandHandler } from './commands.js';
 import { connect, createSession, listModels, pickRandomModel } from './opencode.js';
@@ -7,6 +8,13 @@ import {
   sendMessage,
   updateWebhook,
 } from './onlyorders.js';
+import {
+  parseMessengerEvents,
+  sendImage as sendFbImage,
+  sendMessage as sendFbMessage,
+  verifySignature,
+  verifyWebhook,
+} from './facebook.js';
 import { startTunnel, watchTunnelUrl } from './tunnel.js';
 import { homeDir, loadDb, loadState, logState, saveDb, saveState } from './config.js';
 
@@ -24,10 +32,50 @@ export async function readBody(req) {
   for await (const chunk of req) chunks.push(chunk);
   const text = Buffer.concat(chunks).toString('utf8');
   try {
+    req.rawBody = text;
+  } catch { /* non-extensible request in tests */ }
+  try {
     return JSON.parse(text || '{}');
   } catch {
     return {};
   }
+}
+
+/** Owner-only mode: sender IDs allowed to use the bot (null = everyone). */
+export function ownerIds() {
+  const fromEnv = (process.env.OWNER_PSIDS ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+  const db = loadDb();
+  const fromDb = Array.isArray(db.ownerIds) ? db.ownerIds.map(String) : [];
+  const all = [...fromEnv, ...fromDb].filter(Boolean);
+  return all.length ? all : null;
+}
+export function loadDotenv() {
+  try {
+    const file = path.join(homeDir(), '.env');
+    if (!fs.existsSync(file)) return;
+    for (const line of fs.readFileSync(file, 'utf8').split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const eq = trimmed.indexOf('=');
+      if (eq < 0) continue;
+      const key = trimmed.slice(0, eq).trim();
+      let value = trimmed.slice(eq + 1).trim().replace(/^["']|["']$/g, '');
+      if (key && !(key in process.env)) process.env[key] = value;
+    }
+  } catch { /* .env is optional */ }
+}
+
+/** Direct-Facebook config from env (preferred) or db.json. Null = OnlyOrders mode. */
+export function facebookConfig() {
+  const db = loadDb();
+  const pageToken = process.env.FB_PAGE_TOKEN?.trim() || db.fbPageToken || null;
+  if (!pageToken) return null;
+  return {
+    pageToken,
+    verifyToken: process.env.FB_VERIFY_TOKEN?.trim() || db.fbVerifyToken || 'msgctrl-verify',
+    appSecret: process.env.FB_APP_SECRET?.trim() || db.fbAppSecret || null,
+    pageId: process.env.FB_PAGE_ID?.trim() || db.fbPageId || db.pageId || null,
+  };
 }
 
 /**
@@ -44,27 +92,51 @@ export function createHttpServer({
   onSelectedPages = () => {},
   onWebhookEvent = () => {},
   log = () => {},
+  facebook = null,
+  allowedIds = null,
 } = {}) {
+  const fb = facebook ?? (client ? facebookConfig() : null);
   const handle = client
     ? createCommandHandler({
         client,
         defaultDirectory,
         defaultSessionId,
+        allowedIds: allowedIds ?? ownerIds(),
         send: (text, event) => {
-          const targetPage = String(event?.pageId ?? pageId ?? '');
           const recipientId = String(event?.customerInfo?.id ?? '');
-          if (!targetPage || !recipientId) {
-            console.error('[reply] no pageId/recipientId in event');
+          if (!recipientId) {
+            console.error('[reply] no recipientId in event');
             return Promise.resolve();
           }
           log('reply', { to: recipientId, text: String(text).slice(0, 120) });
           // A failed Messenger send must never take down the webhook receiver.
-          return sendMessage(serviceId, targetPage, recipientId, text).catch((err) => {
+          const delivery = fb
+            ? sendFbMessage({ pageToken: fb.pageToken, recipientId, text })
+            : (() => {
+                const targetPage = String(event?.pageId ?? pageId ?? '');
+                if (!targetPage) {
+                  console.error('[reply] no pageId in event');
+                  return Promise.resolve();
+                }
+                return sendMessage(serviceId, targetPage, recipientId, text);
+              })();
+          return delivery.catch((err) => {
             log('reply-error', {
               to: recipientId,
               error: err instanceof Error ? err.message : String(err),
             });
             console.error('[reply] OnlyOrders send failed:', err instanceof Error ? err.message : err);
+          });
+        },
+        sendImage: (imageUrl, event) => {
+          const recipientId = String(event?.customerInfo?.id ?? '');
+          if (!recipientId || !fb) return Promise.resolve();
+          log('reply-image', { to: recipientId, url: String(imageUrl).slice(0, 120) });
+          return sendFbImage({ pageToken: fb.pageToken, recipientId, imageUrl }).catch((err) => {
+            log('reply-error', {
+              to: recipientId,
+              error: err instanceof Error ? err.message : String(err),
+            });
           });
         },
         log,
@@ -79,10 +151,21 @@ export function createHttpServer({
     if (req.method === 'GET' && url.pathname === '/health') {
       return json(res, 200, {
         ok: true,
-        serviceId,
-        pageId: pageId ?? null,
+        mode: fb ? 'facebook-direct' : 'onlyorders',
+        serviceId: serviceId ?? null,
+        pageId: fb?.pageId ?? pageId ?? null,
         tunnelUrl: publicUrl,
       });
+    }
+
+    // Meta webhook verification: GET /webhook?hub.mode=subscribe&hub.verify_token=...&hub.challenge=...
+    if (req.method === 'GET' && url.pathname === '/webhook' && fb) {
+      const challenge = verifyWebhook(Object.fromEntries(url.searchParams), fb.verifyToken);
+      log('verify', { ok: challenge !== null });
+      if (challenge === null) return json(res, 403, { error: 'verify token mismatch' });
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.end(challenge);
+      return;
     }
 
     // Called by OnlyOrders' internal_facebook_url after the merchant selects Pages.
@@ -131,6 +214,29 @@ export function createHttpServer({
 
     if (req.method === 'POST' && (url.pathname === '/webhook' || url.pathname === '/')) {
       const event = await readBody(req);
+      // Direct Meta format: {object:'page', entry:[...]} — normalize to the
+      // OnlyOrders-shaped event the command handler already understands.
+      if (event?.object === 'page' && Array.isArray(event?.entry)) {
+        if (fb && !verifySignature(req.rawBody ?? '', fb.appSecret, req.headers['x-hub-signature-256'])) {
+          return json(res, 403, { error: 'bad signature' });
+        }
+        json(res, 200, { received: true });
+        setImmediate(() => {
+          const msgs = parseMessengerEvents(event);
+          if (!msgs.length) log('webhook-empty', { keys: Object.keys(event ?? {}) });
+          for (const msg of msgs) {
+            const normalized = {
+              payload: { text: msg.text, mid: msg.mid, attachments: msg.attachments ?? [] },
+              customerInfo: { id: msg.senderId },
+              pageId: msg.pageId || fb?.pageId || pageId || '',
+            };
+            onWebhookEvent(normalized);
+            if (handle) handle(normalized).catch((err) => console.error('[handler]', err));
+          }
+        });
+        return;
+      }
+      // Legacy OnlyOrders format below.
       // ACK immediately: OnlyOrders times its webhook POST out after 10 seconds.
       json(res, 200, { received: true });
       setImmediate(() => {
@@ -149,9 +255,13 @@ export function createHttpServer({
 
 /** Starts the long-running runtime: OpenCode connection, quick tunnel, webhook sync, HTTP. */
 export async function startRuntime({ port = PORT, logger = console } = {}) {
+  loadDotenv();
   const db = loadDb();
+  const fb = facebookConfig();
   const serviceId = db.serviceId ?? process.env.ONLYORDERS_SERVICE_ID?.trim();
-  if (!serviceId) throw new Error('No serviceId in db.json — run `msgctrl init` first');
+  if (!fb && !serviceId) {
+    throw new Error('No serviceId in db.json and no FB_PAGE_TOKEN — run `msgctrl init` or set FB_PAGE_TOKEN');
+  }
 
   const { client, endpoint } = await connect();
   logger.log(`[opencode] connected to ${endpoint.url}`);
@@ -179,6 +289,17 @@ export async function startRuntime({ port = PORT, logger = console } = {}) {
   const onWebhookSync = async (baseUrl) => {
     activeServer?.setPublicUrl(baseUrl);
     const url = `${baseUrl.replace(/\/+$/, '')}/webhook`;
+    if (fb) {
+      // Direct Meta mode: the callback URL is fixed by hand in the app dashboard.
+      saveState({
+        tunnelUrl: baseUrl,
+        webhookUrl: url,
+        webhookUpdatedAt: new Date().toISOString(),
+      });
+      logState('webhook', `tunnel up; set Meta callback to ${url}`);
+      logger.log(`[facebook] tunnel up — set Meta webhook callback to: ${url}`);
+      return;
+    }
     const current = loadDb();
     const hook = current.webhookId
       ? await updateWebhook(serviceId, current.webhookId, url)
@@ -196,11 +317,12 @@ export async function startRuntime({ port = PORT, logger = console } = {}) {
   // Bind the HTTP receiver first so a port conflict fails fast and never leaves an orphan tunnel.
   const server = createHttpServer({
     serviceId,
-    pageId: db.pageId ?? null,
+    pageId: fb?.pageId ?? db.pageId ?? null,
     port,
     client,
     defaultDirectory: db.defaultDirectory ?? DEFAULT_DIRECTORY,
     defaultSessionId: botSessionId,
+    facebook: fb,
     log: (kind, detail) => logState(kind, JSON.stringify(detail)),
   });
   await new Promise((resolve, reject) => {
@@ -215,18 +337,27 @@ export async function startRuntime({ port = PORT, logger = console } = {}) {
   let tunnelUrl;
 
   if (externalTunnel) {
-    // The tunnel runs as its own systemd unit; watch its log for URL changes.
-    const logPath =
-      process.env.MSGCTRL_TUNNEL_LOG ?? db.tunnelLogPath ?? path.join(homeDir(), 'msgctrl-tunnel.log');
-    tunnel = watchTunnelUrl({ file: logPath, onUrl: onWebhookSync, logger });
-    const deadline = Date.now() + 15_000;
-    while (!tunnel.url && Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 500));
-    }
-    tunnelUrl = tunnel.url;
-    if (!tunnelUrl) {
-      logger.warn('[tunnel] no URL in service log yet — will sync when it appears');
-      logState('tunnel', 'waiting for msgctrl-tunnel.service URL');
+    // Named tunnel (permanent domain): the public URL is static, no log to watch.
+    const staticUrl =
+      process.env.MSGCTRL_TUNNEL_URL?.trim() || loadDb().staticTunnelUrl || null;
+    if (staticUrl) {
+      tunnel = { url: staticUrl, stop() {} };
+      tunnelUrl = staticUrl;
+      await onWebhookSync(staticUrl);
+    } else {
+      // The tunnel runs as its own systemd unit; watch its log for URL changes.
+      const logPath =
+        process.env.MSGCTRL_TUNNEL_LOG ?? db.tunnelLogPath ?? path.join(homeDir(), 'msgctrl-tunnel.log');
+      tunnel = watchTunnelUrl({ file: logPath, onUrl: onWebhookSync, logger });
+      const deadline = Date.now() + 15_000;
+      while (!tunnel.url && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+      tunnelUrl = tunnel.url;
+      if (!tunnelUrl) {
+        logger.warn('[tunnel] no URL in service log yet — will sync when it appears');
+        logState('tunnel', 'waiting for msgctrl-tunnel.service URL');
+      }
     }
   } else {
     tunnel = startTunnel({

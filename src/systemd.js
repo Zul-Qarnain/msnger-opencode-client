@@ -74,7 +74,7 @@ export function msgctrlUnitContent({
 }) {
   const home = process.env.HOME ?? '/home/ubuntu';
   return `[Unit]
-Description=Messenger OpenCode control panel (OnlyOrders external service)
+Description=Messenger OpenCode control panel
 Wants=network-online.target msgctrl-tunnel.service
 After=network-online.target msgctrl-tunnel.service
 
@@ -89,6 +89,7 @@ Environment=DEFAULT_DIRECTORY=${defaultDirectory}
 Environment=OPENCODE_MODEL=${process.env.OPENCODE_MODEL ?? 'opencode/hy4-flash-free'}
 Environment=MSGCTRL_EXTERNAL_TUNNEL=1
 Environment=MSGCTRL_TUNNEL_LOG=${tunnelLogPath}
+EnvironmentFile=-${path.join(workdir, '.env')}
 ExecStart=${nodeBin} ${path.join(workdir, 'bin', 'msgctrl')} start
 Restart=always
 RestartSec=5
@@ -123,9 +124,13 @@ WantedBy=multi-user.target
 `;
 }
 
-export function tunnelUnitContent({ user, binary, port = 8788, logPath }) {
+export function tunnelUnitContent({ user, binary, port = 8788, logPath, tunnelConfigFile = null }) {
   const home = process.env.HOME ?? '/home/ubuntu';
-  const command = `${binary} tunnel --no-autoupdate --url http://127.0.0.1:${port} 2>&1 | tee -a ${logPath}`;
+  // Named tunnel (permanent domain): route comes from the local config file.
+  // Quick tunnel otherwise (ephemeral URL).
+  const command = tunnelConfigFile
+    ? `${binary} tunnel --no-autoupdate --config ${tunnelConfigFile} run 2>&1 | tee -a ${logPath}`
+    : `${binary} tunnel --no-autoupdate --url http://127.0.0.1:${port} 2>&1 | tee -a ${logPath}`;
   return `[Unit]
 Description=Cloudflare quick tunnel for msgctrl webhook receiver
 After=network-online.target

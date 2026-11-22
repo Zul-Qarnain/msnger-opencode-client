@@ -2,7 +2,7 @@
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { runInit } from '../src/init.js';
+import { runInit, runFacebookInit } from '../src/init.js';
 import { startRuntime } from '../src/server.js';
 import { loadDb, loadState } from '../src/config.js';
 import { installUnit, uninstallUnit } from '../src/systemd.js';
@@ -14,7 +14,8 @@ const [command = 'help', ...args] = process.argv.slice(2);
 const HELP = `msgctrl — Messenger OpenCode control panel
 
 Usage:
-  msgctrl init               Interactive first-time setup
+  msgctrl init               Interactive first-time setup (OnlyOrders)
+  msgctrl init --facebook   Setup for your own Meta app (no OnlyOrders)
   msgctrl start              Run the service (tunnel + webhook sync + messenger bridge)
   msgctrl status             Show stored config and recent state
   msgctrl install            Install the systemd user unit
@@ -43,7 +44,8 @@ async function status() {
 async function main() {
   switch (command) {
     case 'init':
-      await runInit();
+      if (args.includes('--facebook')) await runFacebookInit();
+      else await runInit();
       break;
     case 'start':
       process.env.OPENCODE_MODEL ||= loadDb().defaultModel || 'opencode/hy4-flash-free';

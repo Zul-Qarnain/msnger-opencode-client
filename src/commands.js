@@ -12,6 +12,7 @@ import {
 } from './opencode.js';
 import { createTerminal as realCreateTerminal } from './terminal.js';
 import { createSessionPoller } from './poller.js';
+import { saveImageAttachment, transcribeVoiceAttachment } from './voice.js';
 
 const run = promisify(exec);
 
@@ -75,20 +76,6 @@ async function activeModel(client, state) {
   return state.modelList[0] ?? envModel();
 }
 
-/**
- * Thinking relays: send the 1st full thinking step, skip the next 2, send a compact
- * "(Thinking.....)" for the 4th, then repeat (5th full, 8th compact, ...).
- */
-function thinkingRelay(reply) {
-  let step = 0;
-  return (thought) => {
-    step += 1;
-    if (step % 4 === 1) return reply(`thinking: ${thought}`);
-    if (step % 4 === 0) return reply('(Thinking.....)');
-    return undefined;
-  };
-}
-
 function formatPermission(permission) {
   const resources = permission.resources ? `\nresources: ${permission.resources}` : '';
   const message = permission.message ? `\nmessage: ${permission.message}` : '';
@@ -149,8 +136,13 @@ export function createCommandHandler({
   createTerminal = realCreateTerminal,
   createSessionPoller: makePoller = createSessionPoller,
   defaultSessionId = null,
+  transcribeVoice = transcribeVoiceAttachment,
+  saveImage = saveImageAttachment,
+  allowedIds = null,
+  sendImage = null,
 }) {
   const states = new Map();
+  const allowed = allowedIds?.length ? new Set(allowedIds) : null;
 
   function stopPoller(state) {
     if (state.poller) {
@@ -167,7 +159,7 @@ export function createCommandHandler({
     state.poller = makePoller({
       client,
       sessionID,
-      onThinking: thinkingRelay(send),
+      onThinking: () => {},
       onReply: send,
       onError: (error) => send(`error [poll]: ${error}`),
       onPermission: permissionHandler(state, send),
@@ -236,8 +228,9 @@ export function createCommandHandler({
   }
 
   async function handle(event) {
-    const text = String(event?.payload?.text ?? '').trim();
-    if (!text) return;
+    let text = String(event?.payload?.text ?? '').trim();
+    const attachments = event?.payload?.attachments ?? [];
+    if (!text && !attachments.length) return;
 
     const key = String(event?.customerInfo?.id ?? 'global');
     const state = states.get(key) ?? initialState(defaultDirectory, defaultSessionId);
@@ -245,10 +238,40 @@ export function createCommandHandler({
     const pageId = String(event?.pageId ?? '');
     const reply = (message) => send(message, event);
 
+    // Owner-only mode: strangers are dropped silently (logged, never answered).
+    const senderId = String(event?.customerInfo?.id ?? '');
+    if (allowed && senderId && !allowed.has(senderId)) {
+      log('blocked', { from: senderId });
+      return;
+    }
+
     // A default session may be set at startup; begin polling on the first interaction so output
     // from any already-running turn is reported without waiting for an explicit attach.
     if (state.sessionId && !state.poller && !state.terminal) {
       startPoller(state, state.sessionId, reply);
+    }
+
+    // Voice note → Deepgram transcript becomes the prompt. Image → saved on disk.
+    if (!text || text.startsWith('[attachment')) {
+      const audio = attachments.find((a) => /audio|voice/.test(a.type ?? ''));
+      const image = attachments.find((a) => (a.type ?? '') === 'image');
+      if (audio) {
+        await reply('🎤 transcribing voice…');
+        try {
+          const { transcript } = await transcribeVoice(audio);
+          text = transcript;
+          await reply(`🎤 you said: ${transcript}`);
+        } catch (err) {
+          return reply(`voice failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      } else if (image) {
+        try {
+          const saved = await saveImage(image, event?.payload?.mid);
+          return reply(`📷 image saved (${Math.max(1, Math.round(saved.bytes / 1024))}kb)`);
+        } catch (err) {
+          return reply(`image save failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
     }
 
     // Full terminal mode: every subsequent message is a command until /exit or `exit`.
@@ -285,6 +308,27 @@ export function createCommandHandler({
         },
       });
       return reply('terminal opened at /home. Send shell commands; /exit or `exit` closes it.');
+    }
+
+    if (/^\/help$/i.test(text)) {
+      return reply(
+        'Commands:\n' +
+          '/session — list OpenCode sessions\n' +
+          '/session N — attach to session N\n' +
+          '/session new /dir — create + attach a session in /dir\n' +
+          '/session pwd — show attached session + model\n' +
+          '/model ls — list connected models\n' +
+          '/models N — switch attached session to model N\n' +
+          '/model pwd — show active model\n' +
+          '/compact — compact the attached session\n' +
+          '/bash — open persistent terminal at /home\n' +
+          '!<cmd> — run a shell command (e.g. !ls, !cd /tmp)\n' +
+          '/img <url> — send an image by public URL\n' +
+          '/allow|/always|/reject <id> — answer a permission request\n' +
+          '/exit — detach session / close terminal\n' +
+          '/help — this list\n' +
+          'anything else — prompt the attached session',
+      );
     }
 
     try {
@@ -364,6 +408,32 @@ export function createCommandHandler({
         await switchModel(client, state.sessionId, model);
         state.lastModel = model;
         return reply(`session ${state.sessionId} now uses ${model.providerID}/${model.modelID}`);
+      }
+
+      // Compact the attached session to free context.
+      const compactMatch = /^\/compact$/i.exec(text);
+      if (compactMatch) {
+        if (!state.sessionId) return reply('No active session. Connect one with /session first.');
+        try {
+          await client.session.compact({ sessionID: state.sessionId });
+          return reply('session compacted');
+        } catch (err) {
+          return reply(`compact failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+
+      // Send an image by public URL (direct Facebook mode only).
+      const imgMatch = /^\/img\s+(.+)$/i.exec(text);
+      if (imgMatch) {
+        const imageUrl = imgMatch[1].trim();
+        if (!/^https?:\/\//i.test(imageUrl)) return reply('Usage: /img <public-image-url>');
+        if (!sendImage) return reply('image sending needs direct Facebook mode');
+        try {
+          await sendImage(imageUrl, event);
+          return undefined;
+        } catch (err) {
+          return reply(`image send failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
       }
 
       // Permission decisions: /allow <id>, /always <id>, /reject <id>

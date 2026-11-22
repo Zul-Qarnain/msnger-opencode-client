@@ -144,7 +144,8 @@ function setup(overrides = {}) {
       return poller;
     },
   });
-  const incoming = (text) => handle({ pageId: 'PAGE', customerInfo: { id: 'USER' }, payload: { text } });
+  const incoming = (text, attachments) =>
+    handle({ pageId: 'PAGE', customerInfo: { id: 'USER' }, payload: { text, attachments } });
   return {
     replies,
     calls,
@@ -250,7 +251,7 @@ test('attaching to a running session starts polling and streams from that moment
   assert.equal(poller.sessionID, 's1');
   poller.tick();
   const joined = replies.join('\n');
-  assert.match(joined, /^thinking: Let me check the answer\./m);
+  assert.doesNotMatch(joined, /thinking:/);
   assert.match(joined, /Hello from OpenCode/);
 });
 
@@ -320,7 +321,7 @@ test('a failed tool step does not prevent the final reply', async () => {
   assert.match(replies.join('\n'), /error \[poll\]: one tool failed/);
 });
 
-test('thinking relay sends 1st full, skips 2, sends compact 4th, then full 5th', async () => {
+test('thinking output is swallowed, only the final answer is delivered', async () => {
   const replies = [];
   const { client } = makeClient();
   let poller;
@@ -345,12 +346,7 @@ test('thinking relay sends 1st full, skips 2, sends compact 4th, then full 5th',
   await handle({ pageId: 'PAGE', customerInfo: { id: 'USER' }, payload: { text: '/session 1' } });
   replies.length = 0;
   poller.tick();
-  assert.deepEqual(replies, [
-    'thinking: step one',
-    '(Thinking.....)',
-    'thinking: step five',
-    'Hello from OpenCode',
-  ]);
+  assert.deepEqual(replies, ['Hello from OpenCode']);
 });
 
 test('/bash opens a stateful terminal, streams output and /exit closes it', async () => {
@@ -514,15 +510,15 @@ test('/session lists then /session 2 attaches', async () => {
   assert.match(replies.at(-1).text, /Attached successfully to session 2: s2/);
 });
 
-test('prompt is enqueued and the poller delivers thinking then the final answer', async () => {
+test('prompt is enqueued and the poller delivers only the final answer', async () => {
   const ctx = setup();
   const { replies, calls, incoming } = ctx;
   await incoming('/session 1');
   await incoming('what is 2+2?');
   assert.equal(calls.prompt.at(-1).text, 'what is 2+2?');
   ctx.poller.tick();
-  assert.equal(replies.at(-2).text, 'thinking: Let me check the answer.');
   assert.equal(replies.at(-1).text, 'Hello from OpenCode');
+  assert.ok(!replies.some((r) => /^thinking:/m.test(r.text ?? r)));
   assert.doesNotMatch(replies.at(-1).text, /calling tool|write_tool/);
 });
 
@@ -575,4 +571,121 @@ test('splitText chunks long replies and never returns an empty reply', () => {
   assert.equal(chunks.length, 3);
   assert.ok(chunks.every((chunk) => chunk.length <= 1500));
   assert.equal(chunks.join(''), 'x'.repeat(3200));
+});
+
+test('/help lists every command', async () => {  const { replies, incoming } = setup();
+  await incoming('/help');
+  const text = replies.at(-1).text;
+  for (const cmd of ['/session', '/model', '/bash', '!<cmd>', '/allow', '/exit', '/help']) {
+    assert.match(text, new RegExp(cmd.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  }
+});
+
+test('voice attachment is transcribed and sent as a prompt', async () => {
+  const replies = [];
+  const prompts = [];
+  const { client } = makeClient();
+  client.session.prompt = async (input) => prompts.push(input);
+  const handle = createCommandHandler({
+    client,
+    defaultDirectory: '/default',
+    send: async (text) => replies.push(text),
+    transcribeVoice: async () => ({ transcript: 'do the thing', confidence: 0.99 }),
+    saveImage: async () => ({ file: '/tmp/x.jpg', bytes: 100 }),
+    createSessionPoller: () => ({ stop() {}, tick() {} }),
+    defaultSessionId: 's1',
+  });
+  await handle({
+    pageId: 'PAGE',
+    customerInfo: { id: 'USER' },
+    payload: { text: '[attachment:audio]', attachments: [{ type: 'audio', url: 'https://cdn/x.mp4' }] },
+  });
+  await new Promise((r) => setTimeout(r, 20));
+  assert.match(replies.join('\n'), /transcribing voice/);
+  assert.match(replies.join('\n'), /you said: do the thing/);
+  assert.equal(prompts.at(-1)?.text, 'do the thing');
+});
+
+test('image attachment is saved and acknowledged without prompting', async () => {
+  const replies = [];
+  const prompts = [];
+  const { client } = makeClient();
+  client.session.prompt = async (input) => prompts.push(input);
+  const handle = createCommandHandler({
+    client,
+    defaultDirectory: '/default',
+    send: async (text) => replies.push(text),
+    transcribeVoice: async () => ({ transcript: 'x', confidence: 1 }),
+    saveImage: async () => ({ file: '/tmp/x.jpg', bytes: 2048 }),
+    createSessionPoller: () => ({ stop() {}, tick() {} }),
+  });
+  await handle({
+    pageId: 'PAGE',
+    customerInfo: { id: 'USER' },
+    payload: { text: '[attachment:image]', attachments: [{ type: 'image', url: 'https://cdn/x.jpg' }] },
+  });
+  assert.match(replies.join('\n'), /image saved/);
+  assert.equal(prompts.length, 0);
+});
+
+test('strangers are silently dropped when allowedIds is set', async () => {
+  const replies = [];
+  const prompts = [];
+  const { client } = makeClient();
+  client.session.prompt = async (input) => prompts.push(input);
+  const handle = createCommandHandler({
+    client,
+    defaultDirectory: '/default',
+    send: async (text) => replies.push(text),
+    allowedIds: ['USER'],
+    createSessionPoller: () => ({ stop() {}, tick() {} }),
+    defaultSessionId: 's1',
+  });
+  await handle({ pageId: 'PAGE', customerInfo: { id: 'EVIL' }, payload: { text: 'hello' } });
+  await handle({ pageId: 'PAGE', customerInfo: { id: 'USER' }, payload: { text: 'hi' } });
+  assert.equal(prompts.length, 1);
+  assert.equal(prompts[0].text, 'hi');
+  assert.ok(!replies.join('\n').includes('hello'));
+});
+
+test('/img sends an image by URL and validates input', async () => {
+  const sent = [];
+  const { client } = makeClient();
+  const handle = createCommandHandler({
+    client,
+    defaultDirectory: '/default',
+    send: async () => {},
+    sendImage: async (url, event) => sent.push({ url, to: event?.customerInfo?.id }),
+    createSessionPoller: () => ({ stop() {}, tick() {} }),
+  });
+  await handle({ pageId: 'PAGE', customerInfo: { id: 'USER' }, payload: { text: '/img https://cdn/x.png' } });
+  assert.deepEqual(sent, [{ url: 'https://cdn/x.png', to: 'USER' }]);
+  const replies = [];
+  const handle2 = createCommandHandler({
+    client,
+    defaultDirectory: '/default',
+    send: async (text) => replies.push(text),
+    createSessionPoller: () => ({ stop() {}, tick() {} }),
+  });
+  await handle2({ pageId: 'PAGE', customerInfo: { id: 'USER' }, payload: { text: '/img not-a-url' } });
+  assert.match(replies.at(-1), /Usage: \/img/);
+});
+
+test('/compact compacts the attached session', async () => {
+  const replies = [];
+  const { client, calls } = makeClient();
+  calls.compact = [];
+  client.session.compact = async (input) => calls.compact.push(input);
+  const handle = createCommandHandler({
+    client,
+    defaultDirectory: '/default',
+    send: async (text) => replies.push(text),
+    createSessionPoller: () => ({ stop() {}, tick() {} }),
+  });
+  await handle({ pageId: 'PAGE', customerInfo: { id: 'USER' }, payload: { text: '/compact' } });
+  assert.match(replies.at(-1), /No active session/);
+  await handle({ pageId: 'PAGE', customerInfo: { id: 'USER' }, payload: { text: '/session 1' } });
+  await handle({ pageId: 'PAGE', customerInfo: { id: 'USER' }, payload: { text: '/compact' } });
+  assert.deepEqual(calls.compact, [{ sessionID: 's1' }]);
+  assert.match(replies.at(-1), /session compacted/);
 });

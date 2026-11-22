@@ -266,3 +266,103 @@ export async function runInit({
     io.close?.();
   }
 }
+
+/**
+ * First-time setup for direct-Facebook mode (own Meta app, no OnlyOrders).
+ * Brings up a tunnel so the user can paste a public Callback URL into the
+ * Meta dashboard, then installs the systemd units. Webhook verification
+ * happens live on every restart via GET /webhook.
+ */
+export async function runFacebookInit({
+  io = defaultIo(),
+  tunnel = { startTunnel, isInstalled: tunnelInstalled },
+  system = systemd,
+  services = { detectServices, activeSystemdUnit },
+  installer = defaultInstaller,
+  port = PORT,
+} = {}) {
+  const print = io.print ?? console.log;
+  const ask = io.ask;
+  if (!ask) throw new Error('io.ask is required');
+
+  print('=== msgctrl init --facebook (direct Meta app, no OnlyOrders) ===');
+
+  const cf = await installer.toolStatus('cloudflared', services.detectServices?.()?.binaries?.cloudflared);
+  print(`cloudflared: ${cf.found ? `${cf.version ?? 'unknown version'} (${cf.path})` : 'MISSING'}`);
+  if (!cf.found) {
+    const answer = ((await ask('Install cloudflared now? [Y/n] ')) ?? '').trim().toLowerCase();
+    if (answer === '' || answer.startsWith('y')) {
+      const result = await installer.installCloudflared({
+        sudoAvailable: system.sudoAvailable?.() ?? true,
+      });
+      print(`[install] cloudflared: ${result.ok ? 'ok' : `failed (${result.error ?? 'unknown'})`}`);
+    }
+  }
+  const oc = await installer.toolStatus('opencode', services.detectServices?.()?.binaries?.opencode);
+  print(`opencode: ${oc.found ? `${oc.version ?? 'unknown version'} (${oc.path})` : 'MISSING'}`);
+  if (!oc.found) throw new Error('OpenCode v2 is required — install it, then re-run init --facebook');
+  if (!installer.isOpencodeV2(oc)) throw new Error('OpenCode v2 is required; upgrade, then re-run');
+
+  const verifyToken =
+    (process.env.FB_VERIFY_TOKEN?.trim()) ||
+    (await ask('Verify token [msgctrl-verify] (invent one, paste it into Meta too): ')).trim() ||
+    'msgctrl-verify';
+  const pageId =
+    (process.env.FB_PAGE_ID?.trim()) ||
+    (await ask('Page ID (Meta → Messenger → Page, Enter to skip): ')).trim();
+  if (!process.env.FB_PAGE_TOKEN?.trim()) {
+    print('[warn] FB_PAGE_TOKEN is not set — add it to .env before `msgctrl start`.');
+  }
+
+  saveDb({
+    ...(pageId ? { fbPageId: pageId, pageId } : {}),
+    fbVerifyToken: verifyToken,
+    fbMode: true,
+    initializedAt: new Date().toISOString(),
+  });
+
+  print('[tunnel] starting Cloudflare quick tunnel…');
+  const activeTunnel = tunnel.startTunnel({ localPort: port, onLog: () => {} });
+  const tunnelUrl = await activeTunnel.ready;
+  const callbackUrl = `${tunnelUrl}/webhook`;
+  saveState({ tunnelUrl, webhookUrl: callbackUrl, webhookUpdatedAt: new Date().toISOString() });
+  // Answer Meta's verification GET while the user clicks "Verify and save".
+  const verifyServer = createHttpServer({
+    port,
+    facebook: { pageToken: 'init-pending', verifyToken, appSecret: null, pageId: pageId || null },
+  });
+  await new Promise((resolve, reject) => {
+    verifyServer.once('error', reject);
+    verifyServer.listen(port, '0.0.0.0', resolve);
+  });
+  print(`\nCallback URL (paste into Meta → Webhooks → Edit Callback URL):\n${callbackUrl}`);
+  print(`Verify token (paste next to it):\n${verifyToken}`);
+  print('\nIn Meta: subscribe the Page to `messages` + `messaging_postbacks`, then message the Page.');
+  print('Press Enter here once Meta shows the webhook as verified…');
+  await ask('');
+
+  await new Promise((resolve) => verifyServer.close(resolve));
+  activeTunnel.stop();
+
+  const tunnelLogPath = path.join(homeDir(), 'msgctrl-tunnel.log');
+  const info = services.detectServices?.() ?? null;
+  const boot = system.bootstrapSystemServices
+    ? await system.bootstrapSystemServices({
+        user: process.env.USER ?? 'ubuntu',
+        workdir: process.cwd(),
+        nodeBin: process.execPath,
+        port,
+        defaultDirectory: process.env.DEFAULT_DIRECTORY ?? process.cwd(),
+        tunnelLogPath,
+        opencodeBinary: info?.binaries?.opencode,
+        cloudflaredBinary: info?.binaries?.cloudflared,
+        runtimeUrl: info?.runtime?.opencode?.url,
+      })
+    : { sudo: false };
+  saveDb({ externalTunnel: boot.sudo === true, tunnelLogPath });
+  saveState({ initialized: true, initializedAt: new Date().toISOString(), systemd: boot });
+  print('[systemd] units installed. Put FB_PAGE_TOKEN/FB_APP_SECRET in .env, then: msgctrl start');
+
+  io.close?.();
+  return { tunnelUrl, callbackUrl, verifyToken, pageId: pageId || null, systemd: boot };
+}

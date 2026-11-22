@@ -164,6 +164,11 @@ Health check: `curl http://localhost:8788/health`
 
 | Message | Action |
 |---|---|
+| `/help` | Show this command list |
+| `/img <url>` | Send an image by public URL |
+| voice note (audio attachment) | Transcribed via Deepgram Nova-3, transcript sent as the prompt |
+| photo (image attachment) | Saved to `media/`, acknowledged (vision piping is future work) |
+|---|---|
 | `/bash` | Open a stateful terminal at `/home` (see below) |
 | `!ls`, `!pwd`, `!cd /tmp` | Run a shell command; output is sent back. `!cd` changes the working directory for later `!` commands. |
 | `/session` | List OpenCode sessions with numbers |
@@ -174,6 +179,7 @@ Health check: `curl http://localhost:8788/health`
 | `/model ls` | List connected chat models with numbers |
 | `/models 2` | Switch the attached session to model 2 |
 | `/model pwd` | Show the active model and attached session |
+| `/compact` | Compact the attached session to free context |
 | `/allow <id>` / `/always <id>` / `/reject <id>` | Answer a forwarded OpenCode permission request |
 | anything else | Prompt for the attached session; if none is attached, you get the session list |
 

@@ -8,3 +8,5 @@ state.json
 msgctrl.log
 msgctrl-tunnel.log
 *.service
+*.pem
+media/
