@@ -701,3 +701,13 @@ test('/models switch applies OPENCODE_MODEL_VARIANT', async () => {
     delete process.env.OPENCODE_MODEL_VARIANT;
   }
 });
+
+test('/status shows session, working time and token totals', async () => {
+  const { incoming, replies } = setup({ active: true });
+  await incoming('/session 1');
+  await incoming('/status');
+  const text = replies.at(-1).text;
+  assert.match(text, /Status: Session One/);
+  assert.match(text, /working for/);
+  assert.match(text, /tokens: 0 in \/ 0 out/);
+});

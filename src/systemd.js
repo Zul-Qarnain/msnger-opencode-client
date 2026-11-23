@@ -83,7 +83,7 @@ Type=simple
 User=${user}
 Environment=HOME=${home}
 WorkingDirectory=${workdir}
-Environment=PATH=${detectedPath(nodeBin, ['opencode', 'cloudflared'])}
+Environment=PATH=${detectedPath(nodeBin, ['opencode', 'cloudflared'])}:${home}/.local/bin:${home}/.npm-global/bin:${home}/.opencode/bin
 Environment=PORT=${port}
 Environment=DEFAULT_DIRECTORY=${defaultDirectory}
 Environment=OPENCODE_MODEL=${process.env.OPENCODE_MODEL ?? 'opencode/hy4-flash-free'}

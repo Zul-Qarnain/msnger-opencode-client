@@ -180,6 +180,7 @@ Health check: `curl http://localhost:8788/health`
 | `/models 2` | Switch the attached session to model 2 |
 | `/model pwd` | Show the active model and attached session |
 | `/compact` | Compact the attached session to free context |
+| `/status` | Working time, current-turn progress, token usage (k/M) |
 | `/allow <id>` / `/always <id>` / `/reject <id>` | Answer a forwarded OpenCode permission request |
 | anything else | Prompt for the attached session; if none is attached, you get the session list |
 
@@ -189,10 +190,11 @@ The bot no longer subscribes to OpenCode's live event stream for output. When yo
 session it starts a polling worker that calls `GET /session/:id/message` every 3 seconds, filters
 messages created after the attach time, and forwards:
 
-- `reasoning` parts through the compact thinking relay,
-- `text` parts **once** when the assistant message is complete (no partial/duplicate replies),
+- completed `text` parts **once** when the assistant message is complete (no partial/duplicate replies),
 - assistant errors as `error [poll]: ...`,
 - pending permission requests, which can be answered with `/allow`, `/always`, `/reject`.
+
+Thinking output is never forwarded — only the final answer is delivered. Tool-call chatter is never sent.
 
 This means it also reports output from work that was already running before you attached, and
 prompts only enqueue work — the poller owns all reporting until `/exit`, another attach, or `/bash`.
@@ -210,7 +212,7 @@ prompts only enqueue work — the poller owns all reporting until `/exit`, anoth
 
 ### Output behavior
 
-- **Thinking:** 1st step is sent in full (`thinking: ...`), 2nd and 3rd are skipped, 4th is `(Thinking.....)`, then the pattern repeats (5th full, 8th compact, …). Tool-call chatter is never sent.
+- **Thinking:** never forwarded to Messenger — only the final answer is delivered. Tool-call chatter is never sent.
 - **Final reply:** always sent after the turn finishes, even if a tool step failed.
 - **Errors:** forwarded as `error [type]: message`, deduplicated per message.
 - **Permissions:** forwarded with id/action/resources and reply instructions.

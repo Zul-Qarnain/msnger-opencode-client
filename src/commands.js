@@ -97,7 +97,23 @@ function permissionHandler(state, reply) {
   };
 }
 
-/** Human label for a model, including the effort variant when set. */
+/** Compact token counts: 950 → "950", 1500 → "1.5k", 2_300_000 → "2.30M". */
+function fmtTokens(n) {
+  if (!n) return '0';
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
+  return String(n);
+}
+
+function fmtDur(ms) {
+  if (ms < 0) ms = 0;
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m${s % 60 ? ` ${s % 60}s` : ''}`;
+  const h = Math.floor(m / 60);
+  return `${h}h${m % 60 ? ` ${m % 60}m` : ''}`;
+}
 function modelLabel(model) {
   if (!model) return 'default';
   const variant = model.variant ? ` [${model.variant}]` : '';
@@ -326,6 +342,7 @@ export function createCommandHandler({
           '/models N — switch attached session to model N\n' +
           '/model pwd — show active model\n' +
           '/compact — compact the attached session\n' +
+          '/status — live task status: working time, progress, token usage\n' +
           '/bash — open persistent terminal at /home\n' +
           '!<cmd> — run a shell command (e.g. !ls, !cd /tmp)\n' +
           '/img <url> — send an image by public URL\n' +
@@ -439,6 +456,49 @@ export function createCommandHandler({
         } catch (err) {
           return reply(`image send failed: ${err instanceof Error ? err.message : String(err)}`);
         }
+      }
+
+      // Live status: working time, progress of the current turn, token usage.
+      const statusMatch = /^\/status$/i.exec(text);
+      if (statusMatch) {
+        if (!state.sessionId) return reply('No active session. Connect one with /session first.');
+        const session = await getSession(client, state.sessionId);
+        const model = await activeModel(client, state);
+        const running = await isSessionActive(client, state.sessionId);
+        const now = Date.now();
+        const busy = session?.time?.busy ?? 0;
+        const idle = session?.time?.idle ?? 0;
+        const timeLine = running
+          ? `working for ${fmtDur(now - busy)} (since ${new Date(busy).toLocaleTimeString()})`
+          : busy && idle
+            ? `last run ${fmtDur(idle - busy)}, idle for ${fmtDur(now - idle)}`
+            : 'no run recorded yet';
+        const history = await getSessionHistory(client, state.sessionId, 1);
+        const last = history.at(-1);
+        const progress = !last
+          ? 'no prompts yet'
+          : last.assistant
+            ? `last prompt answered: "${String(last.user).slice(0, 80)}"`
+            : `in progress: "${String(last.user).slice(0, 80)}"`;
+        let input = 0, output = 0, reasoning = 0, cacheRead = 0;
+        try {
+          const all = await client.message.list({ sessionID: state.sessionId, limit: 100, order: 'desc' });
+          for (const m of all.data ?? []) {
+            if (m.type !== 'assistant' || !m.tokens) continue;
+            input += m.tokens.input ?? 0;
+            output += m.tokens.output ?? 0;
+            reasoning += m.tokens.reasoning ?? 0;
+            cacheRead += m.tokens.cache?.read ?? 0;
+          }
+        } catch { /* token totals are best-effort */ }
+        return reply(
+          `Status: ${session?.title ?? state.sessionId} (${state.sessionId})\n` +
+            `directory: ${session?.location?.directory ?? state.cwd}\n` +
+            `model: ${modelLabel(model)}\n` +
+            `${running ? '●' : '○'} ${timeLine}\n` +
+            `${progress}\n` +
+            `tokens: ${fmtTokens(input)} in / ${fmtTokens(output)} out / ${fmtTokens(reasoning)} reasoning / ${fmtTokens(cacheRead)} cache`,
+        );
       }
 
       // Permission decisions: /allow <id>, /always <id>, /reject <id>
