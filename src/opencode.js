@@ -67,6 +67,13 @@ export function modelRef(model) {
   return { id: model.modelID, providerID: model.providerID, ...(model.variant ? { variant: model.variant } : {}) };
 }
 
+/** Applies OPENCODE_MODEL_VARIANT (e.g. xhigh) to a model that has none set. */
+export function applyVariant(model) {
+  const variant = process.env.OPENCODE_MODEL_VARIANT?.trim();
+  if (model && variant && !model.variant) return { ...model, variant };
+  return model;
+}
+
 export function pickRandomModel(models) {
   const chat = models.filter((model) => !model.type || model.type === 'chat');
   const pool = chat.length ? chat : models;
@@ -77,13 +84,13 @@ export function pickRandomModel(models) {
 export async function createSession(client, directory, model) {
   return client.session.create({
     location: { directory },
-    ...(model ? { model: modelRef(model) } : {}),
+    ...(model ? { model: modelRef(applyVariant(model)) } : {}),
     title: 'Messenger control panel',
   });
 }
 
 export async function switchModel(client, sessionID, model) {
-  await client.session.switchModel({ sessionID, model: modelRef(model) });
+  await client.session.switchModel({ sessionID, model: modelRef(applyVariant(model)) });
 }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));

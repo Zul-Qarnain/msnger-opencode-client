@@ -689,3 +689,15 @@ test('/compact compacts the attached session', async () => {
   assert.deepEqual(calls.compact, [{ sessionID: 's1' }]);
   assert.match(replies.at(-1), /session compacted/);
 });
+
+test('/models switch applies OPENCODE_MODEL_VARIANT', async () => {
+  process.env.OPENCODE_MODEL_VARIANT = 'xhigh';
+  try {
+    const { incoming, calls } = setup();
+    await incoming('/session 1');
+    await incoming('/models 2');
+    assert.equal(calls.switchModel.at(-1).model.variant, 'xhigh');
+  } finally {
+    delete process.env.OPENCODE_MODEL_VARIANT;
+  }
+});

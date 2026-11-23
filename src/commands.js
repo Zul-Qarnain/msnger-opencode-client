@@ -97,6 +97,13 @@ function permissionHandler(state, reply) {
   };
 }
 
+/** Human label for a model, including the effort variant when set. */
+function modelLabel(model) {
+  if (!model) return 'default';
+  const variant = model.variant ? ` [${model.variant}]` : '';
+  return `${model.providerID}/${model.modelID}${variant} — ${model.name ?? ''}`;
+}
+
 function formatHistory(turns) {
   if (!turns.length) return 'History: (none yet)';
   return (
@@ -176,9 +183,7 @@ export function createCommandHandler({
     const running = await isSessionActive(client, session.id);
     const model = await activeModel(client, state);
     const history = await getSessionHistory(client, session.id, 3);
-    const modelText = model
-      ? `${model.providerID}/${model.modelID} — ${model.name ?? ''}`
-      : 'default';
+    const modelText = modelLabel(model);
     const status = running
       ? 'Operation running and reporting from now.'
       : 'No operation is currently running on this session.';
@@ -351,7 +356,7 @@ export function createCommandHandler({
           const session = await getSession(client, state.sessionId);
           const model = await activeModel(client, state);
           return reply(
-            `Active session: ${session?.title ?? state.sessionId} (${state.sessionId})\ndirectory: ${session?.location?.directory ?? state.cwd}\nactive model: ${model ? `${model.providerID}/${model.modelID} — ${model.name ?? ''}` : 'default'}`,
+            `Active session: ${session?.title ?? state.sessionId} (${state.sessionId})\ndirectory: ${session?.location?.directory ?? state.cwd}\nactive model: ${modelLabel(model)}`,
           );
         }
         if (!arg) {
@@ -387,7 +392,7 @@ export function createCommandHandler({
           const model = await activeModel(client, state);
           if (!model) return reply('No active model. Connect a session first.');
           return reply(
-            `Active model: ${model.providerID}/${model.modelID} — ${model.name ?? ''}\nsession: ${state.sessionId ?? 'none'}`,
+            `Active model: ${modelLabel(model)}\nsession: ${state.sessionId ?? 'none'}`,
           );
         }
         if (!arg || /^ls$/i.test(arg)) {
