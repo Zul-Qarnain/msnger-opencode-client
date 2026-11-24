@@ -20,7 +20,19 @@
   only non-sensitive confirmations (names, IDs, success flags) — never the
   secret itself.
 
-## 2. Project notes
+## 3. Linked machines
+
+- `harmas` (Hermes agent VPS, Lightsail): reachable FROM this VPS via OpenSSH
+  alias `harmas`/`hermes` — `ssh harmas <cmd>`. Do not change the alias.
+- Auth material lives ONLY on the VPS: private key `~/.ssh/harmas_hermes.pem`
+  (`0600`), host key pinned in `~/.ssh/known_hosts`. Never copy key material
+  into the repo, chat, logs, or any other machine.
+- Hermes webhook listener on Harmas: `hermes-gateway` (user systemd unit),
+  `opencodetask` subscription, health `http://127.0.0.1:8644/health`.
+  Its HMAC secret stays in `~/.hermes/` on Harmas — read it only from there,
+  never commit or forward it.
+
+## 4. Project notes
 
 - Node.js Messenger bot: Meta webhooks → local OpenCode service → replies.
 - Direct-Facebook mode is primary (`src/facebook.js`); OnlyOrders is legacy.
